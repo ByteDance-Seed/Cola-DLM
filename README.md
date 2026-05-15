@@ -307,6 +307,18 @@ For security-sensitive reports, please follow [`SECURITY.md`](SECURITY.md).
 
 ---
 
+## Star History
+
+<a href="https://www.star-history.com/?repos=ByteDance-Seed%2FCola-DLM&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=ByteDance-Seed/Cola-DLM&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=ByteDance-Seed/Cola-DLM&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=ByteDance-Seed/Cola-DLM&type=date&legend=top-left" />
+ </picture>
+</a>
+
+---
+
 ## Citation
 
 If Cola DLM contributes to your research, please cite the paper:
