@@ -341,7 +341,7 @@ You may additionally cite this open-source release:
 @software{cola_dlm_2026,
   title   = {Cola DLM: Official Open-Source Inference Code for Continuous Latent Diffusion Language Model},
   year    = {2026},
-  url     = {https://github.com/your-org/cola-dlm},
+  url     = {[https://github.com/your-org/cola-dlm](https://github.com/ByteDance-Seed/Cola-DLM)},
   version = {0.1.0}
 }
 ```
