@@ -66,6 +66,10 @@ parser.add_argument("--save-every", type=int, default=-1, help="-1 = save only a
 parser.add_argument("--loss-mode", type=str, default="sft", choices=["sft", "all_token"])
 # Chat format
 parser.add_argument("--chat-format", type=str, default="text", choices=["text", "chatml"])
+# Multi-turn boundary handling
+parser.add_argument("--boundary-mode", type=str, default="token", choices=["token", "block"],
+                    help="'token': per-position leakage prevention (handles all patterns). "
+                         "'block': block-level [P,R]/[R,P] classification (legacy).")
 # Block size randomization
 parser.add_argument("--block-size-probs", type=str, default=None,
                     help="comma-separated probs for block sizes 1,2,4,...,block_size. "
@@ -277,7 +281,7 @@ print0(f"Train: {len(train_dataset):,} conversations, Val: {len(val_dataset):,}"
 # ---------------------------------------------------------------------------
 # Noisy copy construction (boundary-aware)
 # ---------------------------------------------------------------------------
-def build_noisy_sample(z_0, roles_str, t_val, z_1, loss_mode, sample_block_size):
+def build_noisy_sample(z_0, roles_str, t_val, z_1, loss_mode, sample_block_size, boundary_mode):
     """Construct the noisy copy with boundary-aware noising.
 
     Returns:
@@ -296,54 +300,77 @@ def build_noisy_sample(z_0, roles_str, t_val, z_1, loss_mode, sample_block_size)
         blk_end = min(blk_start + sample_block_size, L)
         blk_roles = roles_str[blk_start:blk_end]
 
-        has_p = "P" in blk_roles
-        has_r = "R" in blk_roles
-
-        if has_p and has_r:
-            first_p = next(i for i, r in enumerate(blk_roles) if r == "P")
-            first_r = next(i for i, r in enumerate(blk_roles) if r == "R")
-            rp_boundary = first_r < first_p
-
-        for j in range(blk_end - blk_start):
-            pos = blk_start + j
-            is_r = blk_roles[j] == "R"
-
-            if has_p and has_r:
-                if is_r:
+        if boundary_mode == "token":
+            # Per-position: any P after an R in the same block is masked.
+            # Handles [P,R], [R,P], [P,R,P], [R,P,R], etc.
+            seen_r = False
+            for j in range(blk_end - blk_start):
+                pos = blk_start + j
+                if blk_roles[j] == "R":
+                    seen_r = True
                     z_noisy[pos] = (1 - t_val) * z_0[pos] + t_val * z_1[pos]
                     ts_noisy[pos] = t_val * T
                     loss_mask[pos] = 1.0
-                elif rp_boundary:
-                    # [R,P] block: mask P with pure noise to prevent leakage
-                    # (bidirectional attn would let R see future P).
-                    # Use same ts as R to keep uniform timestep within block.
+                elif seen_r:
+                    # P after R → mask with pure noise to prevent leakage
                     z_noisy[pos] = z_1[pos]
                     ts_noisy[pos] = t_val * T
                     loss_mask[pos] = 0.0
                 else:
-                    # [P,R] block: P comes before R, safe for R to see P.
+                    # P before any R → safe conditioning context
                     if loss_mode == "all_token":
                         z_noisy[pos] = (1 - t_val) * z_0[pos] + t_val * z_1[pos]
                         ts_noisy[pos] = t_val * T
                         loss_mask[pos] = 1.0
                     else:
-                        # Keep P clean with ts=0, matching inference repaint.
                         z_noisy[pos] = z_0[pos]
                         ts_noisy[pos] = 0.0
                         loss_mask[pos] = 0.0
-            elif has_r:
-                z_noisy[pos] = (1 - t_val) * z_0[pos] + t_val * z_1[pos]
-                ts_noisy[pos] = t_val * T
-                loss_mask[pos] = 1.0
-            else:
-                if loss_mode == "all_token":
+
+        else:  # boundary_mode == "block"
+            has_p = "P" in blk_roles
+            has_r = "R" in blk_roles
+
+            if has_p and has_r:
+                first_p = next(i for i, r in enumerate(blk_roles) if r == "P")
+                first_r = next(i for i, r in enumerate(blk_roles) if r == "R")
+                rp_boundary = first_r < first_p
+
+            for j in range(blk_end - blk_start):
+                pos = blk_start + j
+                is_r = blk_roles[j] == "R"
+
+                if has_p and has_r:
+                    if is_r:
+                        z_noisy[pos] = (1 - t_val) * z_0[pos] + t_val * z_1[pos]
+                        ts_noisy[pos] = t_val * T
+                        loss_mask[pos] = 1.0
+                    elif rp_boundary:
+                        z_noisy[pos] = z_1[pos]
+                        ts_noisy[pos] = t_val * T
+                        loss_mask[pos] = 0.0
+                    else:
+                        if loss_mode == "all_token":
+                            z_noisy[pos] = (1 - t_val) * z_0[pos] + t_val * z_1[pos]
+                            ts_noisy[pos] = t_val * T
+                            loss_mask[pos] = 1.0
+                        else:
+                            z_noisy[pos] = z_0[pos]
+                            ts_noisy[pos] = 0.0
+                            loss_mask[pos] = 0.0
+                elif has_r:
                     z_noisy[pos] = (1 - t_val) * z_0[pos] + t_val * z_1[pos]
                     ts_noisy[pos] = t_val * T
                     loss_mask[pos] = 1.0
                 else:
-                    z_noisy[pos] = z_0[pos]
-                    ts_noisy[pos] = 0.0
-                    loss_mask[pos] = 0.0
+                    if loss_mode == "all_token":
+                        z_noisy[pos] = (1 - t_val) * z_0[pos] + t_val * z_1[pos]
+                        ts_noisy[pos] = t_val * T
+                        loss_mask[pos] = 1.0
+                    else:
+                        z_noisy[pos] = z_0[pos]
+                        ts_noisy[pos] = 0.0
+                        loss_mask[pos] = 0.0
 
     return z_noisy, loss_mask, target, ts_noisy
 
@@ -425,7 +452,7 @@ def flow_matching_step(dit_model, batch):
     for i, (z_0, roles_str, L, sample_bs) in enumerate(batch):
         z_1 = torch.randn_like(z_0)
         z_noisy, loss_mask, target_vel, ts_noisy = build_noisy_sample(
-            z_0, roles_str, t[i].item(), z_1, args.loss_mode, sample_bs
+            z_0, roles_str, t[i].item(), z_1, args.loss_mode, sample_bs, args.boundary_mode
         )
 
         extended_list.append(torch.cat([z_0.detach(), z_noisy], dim=0))
