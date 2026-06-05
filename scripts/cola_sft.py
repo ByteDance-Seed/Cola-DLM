@@ -20,6 +20,16 @@ import sys
 import time
 from contextlib import nullcontext
 
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    if v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
+
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
@@ -66,6 +76,9 @@ parser.add_argument("--save-every", type=int, default=-1, help="-1 = save only a
 parser.add_argument("--loss-mode", type=str, default="sft", choices=["sft", "all_token"])
 # Chat format
 parser.add_argument("--chat-format", type=str, default="text", choices=["text", "chatml"])
+# Padding strategy
+parser.add_argument("--pad-with-stop", type=str2bool, default=True,
+                    help="Pad end-of-sequence with stop token (default: True)")
 # Multi-turn boundary handling
 parser.add_argument("--boundary-mode", type=str, default="token", choices=["token", "block"],
                     help="'token': per-position leakage prevention (handles all patterns). "
@@ -188,7 +201,7 @@ def get_lr_multiplier(progress):
 # ---------------------------------------------------------------------------
 IM_START = 100264
 IM_END = 100265
-PAD_TOKEN = 100277
+PAD_TOKEN = 100277  # <|pad|> — needs finetuned VAE for chatml mode
 STOP_TOKEN_ID = 47774  # ■ — single token, VAE-reconstructable, no clash with data
 
 
@@ -396,9 +409,13 @@ def prepare_sample(conversation, max_seq_len, vae_mode, sample_bs=None):
     if "R" not in roles_str:
         return None
 
-    # Pad end with ■ tokens (role=R, so model learns to fill with stop tokens)
+    # Pad end of sequence
+    if args.chat_format == "chatml":
+        pad_token = IM_END if args.pad_with_stop else PAD_TOKEN
+    else:
+        pad_token = STOP_TOKEN_ID
     pad_len = (sample_bs - len(ids) % sample_bs) % sample_bs
-    ids = ids + [STOP_TOKEN_ID] * pad_len
+    ids = ids + [pad_token] * pad_len
     roles_str = roles_str + ["R"] * pad_len
 
     L = len(ids)
@@ -570,6 +587,10 @@ def save_checkpoint(step, val_loss):
 
     dit_save = orig_dit if ddp_world_size > 1 else dit
     dit_path = os.path.join(ckpt_dir, f"dit_step_{step:06d}")
+    # Save SFT config into the model config for inference auto-detection
+    dit_save.config.sft_chat_format = args.chat_format
+    dit_save.config.sft_pad_with_stop = args.pad_with_stop
+    dit_save.config.sft_stop_token_id = IM_END if args.chat_format == "chatml" else STOP_TOKEN_ID
     dit_save.save_pretrained(dit_path)
 
     torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, f"optim_{step:06d}.pt"))
