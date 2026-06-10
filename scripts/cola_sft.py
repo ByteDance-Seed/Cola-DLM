@@ -32,6 +32,13 @@ def str2bool(v):
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
+
+def get_cache_dir():
+    """Return Cola-DLM cache directory, default to ./cache/."""
+    d = os.environ.get("COLA_CACHE_DIR", os.path.join(os.path.dirname(os.path.dirname(__file__)), "cache"))
+    os.makedirs(d, exist_ok=True)
+    return d
+
 import torch
 import torch.distributed as dist
 
@@ -44,7 +51,7 @@ parser.add_argument("--dit-path", type=str, default="hf_models/cola_dlm/cola_dit
 parser.add_argument("--vae-path", type=str, default="hf_models/cola_dlm/cola_vae")
 parser.add_argument("--tokenizer-path", type=str, default="hf_models/tokenizer.json")
 # Output
-parser.add_argument("--output-dir", type=str, default="cola_sft_checkpoints")
+parser.add_argument("--output-dir", type=str, default=None, help="default: $COLA_CACHE_DIR/cola_sft_checkpoints")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' = no logging)")
 # Training
 parser.add_argument("--num-iterations", type=int, default=-1, help="-1 = full epoch")
@@ -59,6 +66,8 @@ parser.add_argument("--warmup-ratio", type=float, default=0.05)
 parser.add_argument("--warmdown-ratio", type=float, default=0.3)
 parser.add_argument("--final-lr-frac", type=float, default=0.0)
 # Flow matching
+# Note: paper recommends logit-normal with loc=1.0 for pretraining (d=16),
+# but in preliminary SFT experiments loc=0.0 works better than loc=1.0.
 parser.add_argument("--timestep-dist", type=str, default="logit_normal", choices=["logit_normal", "uniform"])
 parser.add_argument("--logit-normal-loc", type=float, default=0.0)
 parser.add_argument("--logit-normal-scale", type=float, default=1.0)
@@ -70,7 +79,8 @@ parser.add_argument("--mmlu-epochs", type=int, default=3)
 parser.add_argument("--gsm8k-epochs", type=int, default=4)
 # Eval / Save
 parser.add_argument("--eval-every", type=int, default=200, help="-1 = disable")
-parser.add_argument("--eval-steps", type=int, default=20)
+parser.add_argument("--eval-steps", type=int, default=20, help="Deprecated, use --eval-samples")
+parser.add_argument("--eval-samples", type=int, default=0, help="Fixed number of val samples (0 = use eval-steps × device-batch-size)")
 parser.add_argument("--save-every", type=int, default=-1, help="-1 = save only at end")
 # Mode
 parser.add_argument("--loss-mode", type=str, default="sft", choices=["sft", "all_token"])
@@ -87,7 +97,15 @@ parser.add_argument("--boundary-mode", type=str, default="token", choices=["toke
 parser.add_argument("--block-size-probs", type=str, default=None,
                     help="comma-separated probs for block sizes 1,2,4,...,block_size. "
                          "Length must be log2(block_size)+1. Default: 0.1,0,0.3,0.3,0.3")
+# Attention backend
+parser.add_argument("--attn-backend", type=str, default="naive", choices=["naive", "sdpa", "flex"],
+                    help="Attention backend: 'naive' (manual matmul), 'sdpa' (PyTorch SDPA), 'flex' (FlexAttention)")
 args = parser.parse_args()
+
+# Resolve defaults that depend on cache dir
+cache_dir = get_cache_dir()
+if args.output_dir is None:
+    args.output_dir = os.path.join(cache_dir, "cola_sft_checkpoints")
 
 # ---------------------------------------------------------------------------
 # DDP / device init
@@ -131,6 +149,14 @@ else:
 from cola_dlm import ColaDiTModel, ColaTextVAEModel
 from cola_dlm.attention_utils import create_2l_block_causal_mask
 from tokenizers import Tokenizer
+
+attn_backend = args.attn_backend
+if attn_backend != "naive":
+    from cola_dlm.modeling_cola_dit import set_attn_backend
+    set_attn_backend(attn_backend)
+    print0(f"Attention backend: {attn_backend}")
+if attn_backend == "flex":
+    from cola_dlm.attention_utils import create_2l_flex_block_mask
 
 print0("Loading models...")
 vae = ColaTextVAEModel.from_pretrained(args.vae_path).to(device).eval()
@@ -264,17 +290,43 @@ def render_conversation(conversation, max_tokens, chat_format="text"):
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from tasks.common import TaskMixture
+from tasks.customjson import CustomJSON
 from tasks.gsm8k import GSM8K
 from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
 from tasks.spellingbee import SimpleSpelling, SpellingBee
 
+# Download identity conversations if not present, adapt for Cola
+IDENTITY_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl"
+identity_path = os.path.join(cache_dir, "identity_conversations_cola.jsonl")
+if not os.path.exists(identity_path):
+    import urllib.request
+    raw_path = os.path.join(cache_dir, "identity_conversations_raw.jsonl")
+    print0(f"Downloading identity conversations...")
+    urllib.request.urlretrieve(IDENTITY_URL, raw_path)
+    replacements = {
+        "nanochat": "Cola",
+        "Nanochat": "Cola",
+        "NanoChat": "Cola",
+        "Andrej Karpathy": "the Cola team",
+        "andrej karpathy": "the Cola team",
+        "Karpathy": "the Cola team",
+    }
+    with open(raw_path, "r") as fin, open(identity_path, "w") as fout:
+        for line in fin:
+            for old, new in replacements.items():
+                line = line.replace(old, new)
+            fout.write(line)
+    print0(f"Saved Cola identity conversations to {identity_path}")
+
 print0("Loading datasets...")
 train_dataset = TaskMixture(
     [
         SmolTalk(split="train"),
+        CustomJSON(filepath=identity_path),
+        CustomJSON(filepath=identity_path),  # 2 epochs
         *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)],
         *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)],
         SimpleSpelling(size=200000, split="train"),
@@ -409,14 +461,21 @@ def prepare_sample(conversation, max_seq_len, vae_mode, sample_bs=None):
     if "R" not in roles_str:
         return None
 
-    # Pad end of sequence
+    # Pad to max_seq_len (fixed shape for torch.compile compatibility)
     if args.chat_format == "chatml":
         pad_token = IM_END if args.pad_with_stop else PAD_TOKEN
     else:
         pad_token = STOP_TOKEN_ID
-    pad_len = (sample_bs - len(ids) % sample_bs) % sample_bs
-    ids = ids + [pad_token] * pad_len
-    roles_str = roles_str + ["R"] * pad_len
+    unpadded_len = len(ids)
+    pad_len = max_seq_len - len(ids)
+    if pad_len < 0:
+        ids = ids[:max_seq_len]
+        roles_str = roles_str[:max_seq_len]
+        unpadded_len = max_seq_len
+        pad_len = 0
+    if pad_len > 0:
+        ids = ids + [pad_token] * pad_len
+        roles_str = roles_str + ["R"] * pad_len
 
     L = len(ids)
     input_ids = torch.tensor(ids, dtype=torch.long, device=device)
@@ -431,7 +490,7 @@ def prepare_sample(conversation, max_seq_len, vae_mode, sample_bs=None):
 
     z_0 = (z_0 - vae.shifting_factor) * vae.scaling_factor
 
-    return z_0, roles_str, L, sample_bs
+    return z_0, roles_str, L, sample_bs, unpadded_len
 
 
 # ---------------------------------------------------------------------------
@@ -466,13 +525,23 @@ def flow_matching_step(dit_model, batch):
     q_pos_list = []
     ts_list = []
 
-    for i, (z_0, roles_str, L, sample_bs) in enumerate(batch):
+    noisy_first = (attn_backend == "flex")
+
+    for i, (z_0, roles_str, L, sample_bs, unpadded_len) in enumerate(batch):
         z_1 = torch.randn_like(z_0)
         z_noisy, loss_mask, target_vel, ts_noisy = build_noisy_sample(
             z_0, roles_str, t[i].item(), z_1, args.loss_mode, sample_bs, args.boundary_mode
         )
+        if unpadded_len < L:
+            loss_mask[unpadded_len:] = 0.0
 
-        extended_list.append(torch.cat([z_0.detach(), z_noisy], dim=0))
+        if noisy_first:
+            extended_list.append(torch.cat([z_noisy, z_0.detach()], dim=0))
+            ts_list.append(torch.cat([ts_noisy, torch.zeros(L, device=device)]))
+        else:
+            extended_list.append(torch.cat([z_0.detach(), z_noisy], dim=0))
+            ts_list.append(torch.cat([torch.zeros(L, device=device), ts_noisy]))
+
         target_list.append(target_vel)
         mask_list.append(loss_mask)
         seq_lens.append(L)
@@ -481,9 +550,6 @@ def flow_matching_step(dit_model, batch):
         positions = torch.arange(L, device=device)
         k_pos_list.append(torch.cat([positions, positions]))
         q_pos_list.append(torch.cat([positions, positions]))
-
-        # Per-position timestep: clean copy=0, noisy copy=ts_noisy
-        ts_list.append(torch.cat([torch.zeros(L, device=device), ts_noisy]))
 
     # NA-form concatenation
     txt = torch.cat(extended_list, dim=0)
@@ -496,14 +562,18 @@ def flow_matching_step(dit_model, batch):
     timestep = torch.cat(ts_list, dim=0)
 
     # 2L attention mask (per-sample block sizes)
-    attn_mask = create_2l_block_causal_mask(
-        txt_shape,
-        txt_q_shape,
-        seq_lens=seq_lens,
-        block_size=block_sizes_list,
-        dtype=torch.bfloat16,
-        device=device,
-    )
+    if attn_backend == "flex":
+        attn_mask = create_2l_flex_block_mask(
+            txt_shape, txt_q_shape,
+            seq_lens=seq_lens, block_size=block_sizes_list,
+            device=device,
+        )
+    else:
+        attn_mask = create_2l_block_causal_mask(
+            txt_shape, txt_q_shape,
+            seq_lens=seq_lens, block_size=block_sizes_list,
+            dtype=torch.bfloat16, device=device,
+        )
 
     with torch.autocast("cuda", dtype=torch.bfloat16):
         out = dit_model(
@@ -516,11 +586,15 @@ def flow_matching_step(dit_model, batch):
             attn_mask_override=attn_mask,
         )
 
+    # Extract predictions from the noisy copy
     pred_list = []
     offset = 0
     for i, sl in enumerate(seq_lens):
         sample_out = out.txt_sample[offset : offset + 2 * sl]
-        pred_list.append(sample_out[sl:])
+        if noisy_first:
+            pred_list.append(sample_out[:sl])
+        else:
+            pred_list.append(sample_out[sl:])
         offset += 2 * sl
 
     pred = torch.cat(pred_list, dim=0).float()
@@ -564,16 +638,23 @@ def data_generator(dataset, batch_size, max_seq_len, vae_mode):
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
+eval_batch_steps = args.eval_samples // args.device_batch_size if args.eval_samples > 0 else args.eval_steps
+
 @torch.no_grad()
-def evaluate(dit_model, val_gen, eval_steps):
+def evaluate(dit_model, val_gen):
     dit_model.eval()
     losses = []
-    for _ in range(eval_steps):
+    for _ in range(eval_batch_steps):
         batch, _ = next(val_gen)
         loss = flow_matching_step(dit_model, batch)
         losses.append(loss.item())
     dit_model.train()
-    return sum(losses) / len(losses)
+    avg_loss = sum(losses) / len(losses)
+    if ddp_world_size > 1:
+        loss_tensor = torch.tensor([avg_loss], device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+        avg_loss = loss_tensor.item()
+    return avg_loss
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +717,7 @@ for step in range(num_iterations):
 
     # --- Eval ---
     if step == 0 or last_step or (args.eval_every > 0 and step % args.eval_every == 0):
-        val_loss = evaluate(dit, val_gen, args.eval_steps)
+        val_loss = evaluate(dit, val_gen)
         print0(f"Step {step:05d} | Val FM loss: {val_loss:.6f}")
         wandb_run.log({"step": step, "val/fm_loss": val_loss})
 
@@ -645,13 +726,14 @@ for step in range(num_iterations):
         save_checkpoint(step, val_loss)
 
     # --- Training step ---
+    train_loss = 0.0
     for micro_step in range(args.grad_accum_steps):
         is_last_micro = micro_step == args.grad_accum_steps - 1
         ctx = nullcontext() if (is_last_micro or ddp_world_size == 1) else dit.no_sync()
         with ctx:
             batch, epoch = next(train_gen)
             loss = flow_matching_step(dit, batch)
-            train_loss = loss.detach()
+            train_loss += loss.detach() / args.grad_accum_steps
             (loss / args.grad_accum_steps).backward()
 
     # LR update
@@ -670,7 +752,8 @@ for step in range(num_iterations):
     dt = time.time() - t0
 
     # Logging
-    smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * train_loss.item()
+    train_loss_val = train_loss.item() if torch.is_tensor(train_loss) else train_loss
+    smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * train_loss_val
     debiased = smooth_loss / (1 - ema_beta ** (step + 1))
 
     if step % 10 == 0 or last_step:
@@ -683,7 +766,7 @@ for step in range(num_iterations):
         {
             "step": step,
             "train/loss": debiased,
-            "train/raw_loss": train_loss.item(),
+            "train/raw_loss": train_loss_val,
             "train/lr": lrm * args.learning_rate,
             "train/dt": dt,
             "train/epoch": epoch,

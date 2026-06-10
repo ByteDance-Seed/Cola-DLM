@@ -262,3 +262,94 @@ def create_2l_block_causal_mask(
     mask = torch.full((L_q, L_k), min_val, dtype=dtype, device=device)
     mask.masked_fill_(allowed, 0.0 if dtype.is_floating_point else 0)
     return mask.unsqueeze(0).unsqueeze(0)
+
+
+# ---------------------------------------------------------------------------
+# FlexAttention block mask (Fast-dLLM v2 style, adapted for NA form)
+# ---------------------------------------------------------------------------
+
+def create_2l_flex_block_mask(
+    txt_shape: torch.LongTensor,
+    txt_q_shape: torch.LongTensor,
+    seq_lens: list[int],
+    block_size,
+    device: torch.device,
+):
+    """FlexAttention block mask for the 2L training trick (NA form).
+
+    Uses Fast-dLLM v2 layout ``[xt(noisy, L) | x0(clean, L)]`` per sample.
+    The caller must construct the extended sequence in this order.
+
+    Ported directly from Fast-dLLM v2 ``block_diff_mask`` (modeling.py:44-87):
+
+    * M_BD:  bidirectional within same block AND same copy type
+    * M_OBC: noisy Q → clean K, strict causal (``q_block > k_block``)
+    * M_BC:  clean Q → clean K, block-causal (``q_block >= k_block``)
+
+    Adapted for Cola's NA form (multiple samples concatenated, batch=1)
+    by adding per-position ``sample_id`` to prevent cross-sample attention.
+    """
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    k_lens = _as_flat_long(txt_shape)
+    q_lens = _as_flat_long(txt_q_shape)
+    B = int(k_lens.shape[0])
+
+    if isinstance(block_size, int):
+        block_sizes = [block_size] * B
+    else:
+        block_sizes = list(block_size)
+
+    L_k = int(k_lens.sum().item())
+    L_q = int(q_lens.sum().item())
+
+    k_cu = F.pad(k_lens.cumsum(0), (1, 0))
+    q_cu = F.pad(q_lens.cumsum(0), (1, 0))
+
+    # Per-position metadata (O(n) memory)
+    # Layout per sample: [xt(noisy, L_i) | x0(clean, L_i)]
+    # x0_flag = True for clean positions (second half, idx >= L_i within sample)
+    q_sample_id = torch.zeros(L_q, dtype=torch.int32, device=device)
+    q_x0_flag = torch.zeros(L_q, dtype=torch.bool, device=device)
+    q_block_idx = torch.zeros(L_q, dtype=torch.int32, device=device)
+    k_sample_id = torch.zeros(L_k, dtype=torch.int32, device=device)
+    k_x0_flag = torch.zeros(L_k, dtype=torch.bool, device=device)
+    k_block_idx = torch.zeros(L_k, dtype=torch.int32, device=device)
+
+    for b_idx in range(B):
+        L_i = seq_lens[b_idx]
+        bs_i = block_sizes[b_idx]
+
+        # K side: [noisy(L_i) | clean(L_i)]
+        k_start = int(k_cu[b_idx].item())
+        k_local = torch.arange(L_i, device=device)
+        k_sample_id[k_start: k_start + 2 * L_i] = b_idx
+        k_x0_flag[k_start + L_i: k_start + 2 * L_i] = True  # second half = clean
+        k_block_idx[k_start: k_start + L_i] = k_local // bs_i
+        k_block_idx[k_start + L_i: k_start + 2 * L_i] = k_local // bs_i
+
+        # Q side
+        q_start = int(q_cu[b_idx].item())
+        q_len_b = int(q_lens[b_idx].item())
+        q_sample_id[q_start: q_start + q_len_b] = b_idx
+        if q_len_b == 2 * L_i:
+            q_local = torch.arange(L_i, device=device)
+            q_x0_flag[q_start + L_i: q_start + 2 * L_i] = True
+            q_block_idx[q_start: q_start + L_i] = q_local // bs_i
+            q_block_idx[q_start + L_i: q_start + 2 * L_i] = q_local // bs_i
+        else:
+            q_local = torch.arange(q_len_b, device=device)
+            q_block_idx[q_start: q_start + q_len_b] = q_local // bs_i
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        same = q_sample_id[q_idx] == k_sample_id[kv_idx]
+        q_x0 = q_x0_flag[q_idx]
+        k_x0 = k_x0_flag[kv_idx]
+        q_b = q_block_idx[q_idx]
+        k_b = k_block_idx[kv_idx]
+        M_BD = (q_b == k_b) & (q_x0 == k_x0)
+        M_OBC = (q_b > k_b) & k_x0 & (~q_x0)
+        M_BC = (q_b >= k_b) & k_x0 & q_x0
+        return same & (M_BD | M_OBC | M_BC)
+
+    return create_block_mask(mask_mod, B=1, H=None, Q_LEN=L_q, KV_LEN=L_k, device=device)

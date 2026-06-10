@@ -78,6 +78,23 @@ from einops import rearrange
 from torch import nn
 from transformers import AutoConfig, AutoModel, PreTrainedModel
 
+# Attention backend selection (optional, training speedup)
+_ATTN_BACKEND = "naive"  # "naive", "sdpa", "flex"
+_fused_flex_attn_func = None
+
+
+def set_attn_backend(backend: str = "naive"):
+    """Set attention backend: 'naive' (default), 'sdpa', or 'flex'."""
+    global _ATTN_BACKEND, _fused_flex_attn_func
+    assert backend in ("naive", "sdpa", "flex"), f"Unknown backend: {backend}"
+    if backend == "flex":
+        from torch.nn.attention.flex_attention import flex_attention
+        @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
+        def _fused(q, k, v, block_mask):
+            return flex_attention(q, k, v, block_mask=block_mask)
+        _fused_flex_attn_func = _fused
+    _ATTN_BACKEND = backend
+
 from .attention_utils import (
     create_na_block_causal_mask,
 )
@@ -463,10 +480,25 @@ class ColaDiTAttention(nn.Module):
 
         # -- Attention ------------------------------------------------------------
         compute_dtype = torch.bfloat16 if txt_q.is_cuda else txt_q.dtype
+
         q_na = rearrange(txt_q.to(compute_dtype), "l h d -> 1 h l d")
         k_na = rearrange(full_k.to(compute_dtype), "l h d -> 1 h l d")
         v_na = rearrange(full_v.to(compute_dtype), "l h d -> 1 h l d")
-        out = self.slow_attn(q_na, k_na, v_na, attn_mask=attn_block_mask)
+
+        if _ATTN_BACKEND == "flex" and _fused_flex_attn_func is not None:
+            from torch.nn.attention.flex_attention import BlockMask
+            if isinstance(attn_block_mask, BlockMask):
+                out = _fused_flex_attn_func(q_na, k_na, v_na, attn_block_mask)
+            else:
+                out = self.slow_attn(q_na, k_na, v_na, attn_mask=attn_block_mask)
+        elif _ATTN_BACKEND == "sdpa":
+            out = F.scaled_dot_product_attention(
+                q_na, k_na, v_na,
+                attn_mask=attn_block_mask,
+                is_causal=False,
+            )
+        else:
+            out = self.slow_attn(q_na, k_na, v_na, attn_mask=attn_block_mask)
         out = rearrange(out, "1 h l d -> l (h d)").type_as(txt_q)
         return self.proj_out(out)
 
@@ -672,6 +704,10 @@ class ColaDiTModel(PreTrainedModel):
 
         # Build NA attention mask once per forward — identical for every block.
         if attn_mask_override is not None:
+            assert self.txt_in.patch_size == 1, (
+                "attn_mask_override assumes patch_size=1; with patch_size>1 the "
+                "mask dimensions would not match the patchified sequence lengths"
+            )
             attn_mask = attn_mask_override
         else:
             attn_mask = create_na_block_causal_mask(
