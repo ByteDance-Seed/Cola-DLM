@@ -32,6 +32,7 @@
 - **HuggingFace Daily Paper**：[huggingface.co/papers/2605.06548](https://huggingface.co/papers/2605.06548)
 - **项目主页**：[hongcanguo.github.io/Cola-DLM](https://hongcanguo.github.io/Cola-DLM/)
 - **博客解读**：[hongcanguo.github.io/posts/2026-cola-dlm.html](https://hongcanguo.github.io/posts/2026-cola-dlm.html)
+- **Unified 博客解读**：[zhao-yian.github.io/Unified-Cola/blog/2026/unified-cola-en/](https://zhao-yian.github.io/Unified-Cola/blog/2026/unified-cola-en/)
 - **知乎文章**：[zhuanlan.zhihu.com/p/2038324180920313704](https://zhuanlan.zhihu.com/p/2038324180920313704)
 
 ---
