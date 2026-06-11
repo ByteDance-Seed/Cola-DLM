@@ -24,6 +24,12 @@
 
 ---
 
+## 📣 News
+
+[2026.6.11] We have updated the technical details, key design choices, and future research plans for Section 5.5, *Towards a Unified Approach with Image Modalities*. See the [Unified Cola blog](https://zhao-yian.github.io/Unified-Cola/blog/2026/unified-cola/) for details. We welcome collaboration and discussion. Stay tuned.
+
+---
+
 ## Paper
 
 - **Title:** Continuous Latent Diffusion Language Model
@@ -38,7 +44,7 @@
 
 ---
 
-## Method at a glance
+## 🦄 Method at a glance
 
 <p align="center">
   <img src="docs/figures/cola_main_fig.png" alt="Overall workflow of Cola DLM: Text VAE pretraining, joint Text VAE + block-causal Text DiT training, and KV-cached inference." width="900"/>
@@ -78,7 +84,7 @@ Inference (this repo) implements the paper's three-step recipe: **(i) prefix enc
 
 ---
 
-## Highlights
+## 🌟 Highlights
 
 - **Hierarchical latent-variable model.** `ColaTextVAEModel` provides the inference encoder `q_phi` and the conditional decoder `p_theta`; `ColaDiTModel` parameterizes the block-causal latent prior `p_psi`. Diffusion is used to *transport the latent prior* (Eq. 2.1.4 of the paper), not to recover tokens.
 - **HuggingFace-native.** `ColaDiTModel` and `ColaTextVAEModel` subclass `transformers.PreTrainedModel` and ship with matching `PretrainedConfig` classes, so `from_pretrained` / `save_pretrained` / `AutoConfig` all work out of the box.
@@ -92,7 +98,7 @@ See [`docs/architecture.md`](docs/architecture.md) and [`docs/model_card.md`](do
 
 ---
 
-## Installation
+## 📍 Installation
 
 Cola DLM targets **Python 3.9+** and **PyTorch 2.1+** on Linux / macOS.
 
@@ -117,7 +123,7 @@ pip install cola-dlm
 
 ---
 
-## Quickstart
+## 🚀 Quickstart
 
 ### 1. Prepare model weights
 
