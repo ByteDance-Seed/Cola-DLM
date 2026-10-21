@@ -291,6 +291,11 @@ def _shape_tensor(lens: list[int], device: torch.device) -> torch.LongTensor:
     return torch.tensor([[int(l)] for l in lens], dtype=torch.long, device=device)
 
 
+def _inference_autocast(device: torch.device):
+    """Use bf16 autocast on the device selected for inference."""
+    return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+
+
 # ---------------------------------------------------------------------------
 # Main Inference Logic — NA form, no batch padding
 # ---------------------------------------------------------------------------
@@ -418,7 +423,7 @@ def generate_task_repaint_inference(
     # -----------------------------------------------------------------
     # Posterior mode ``(mode() - shift) * scale`` in fp32 — matches the
     # trainer's ``latents_3d = ... .float()`` after the autocast block.
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    with _inference_autocast(device):
         enc = vae.encode(input_ids_list)
         latents_list = [((lat - shift) * scale).float() for lat in enc.latents_list]
 
@@ -514,7 +519,7 @@ def generate_task_repaint_inference(
     if any(p.shape[0] > 0 for p in prefix_list):
         txt_prefix = torch.cat(prefix_list, dim=0).to(torch.bfloat16)
         ts_prefix = torch.zeros(txt_prefix.shape[0], device=device, dtype=torch.bfloat16)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with _inference_autocast(device):
             _ = dit(
                 txt=txt_prefix,
                 txt_shape=txt_shape_prefix,
@@ -523,7 +528,7 @@ def generate_task_repaint_inference(
                 update_kv=True,
                 use_kv_cache=True,
             )
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with _inference_autocast(device):
             _ = vae.decode(
                 z=torch.cat(prefix_list, dim=0),
                 txt_shape=txt_shape_prefix,
@@ -633,7 +638,7 @@ def generate_task_repaint_inference(
             txt_bf16 = txt.to(torch.bfloat16)
             ts_bf16 = ts_batch.to(torch.bfloat16)
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with _inference_autocast(device):
                 drift_cond = dit(
                     txt=txt_bf16,
                     txt_shape=txt_shape_cum,
@@ -669,7 +674,7 @@ def generate_task_repaint_inference(
             txt = txt_next
 
         # ------------ decode one block via VAE (NA) ----------------
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with _inference_autocast(device):
             decoded = vae.decode(
                 z=txt,
                 txt_shape=txt_shape_cum,
@@ -704,7 +709,7 @@ def generate_task_repaint_inference(
 
         # -------- write the just-denoised block into the DiT KV cache --------
         txt_bf16 = txt.to(torch.bfloat16)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with _inference_autocast(device):
             _ = dit(
                 txt=txt_bf16,
                 txt_shape=txt_shape_cum,
